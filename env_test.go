@@ -1,6 +1,9 @@
+// editorconfig-checker-disable-file
 package env
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -106,6 +109,11 @@ type Config struct {
 	DurationPtr  *time.Duration   `env:"DURATION"`
 	DurationPtrs []*time.Duration `env:"DURATIONS"`
 
+	Location     time.Location    `env:"LOCATION"`
+	Locations    []time.Location  `env:"LOCATIONS"`
+	LocationPtr  *time.Location   `env:"LOCATION"`
+	LocationPtrs []*time.Location `env:"LOCATIONS"`
+
 	Unmarshaler     unmarshaler    `env:"UNMARSHALER"`
 	UnmarshalerPtr  *unmarshaler   `env:"UNMARSHALER"`
 	Unmarshalers    []unmarshaler  `env:"UNMARSHALERS"`
@@ -116,7 +124,7 @@ type Config struct {
 	URLs    []url.URL  `env:"URLS"`
 	URLPtrs []*url.URL `env:"URLS"`
 
-	StringWithdefault string `env:"DATABASE_URL" envDefault:"postgres://localhost:5432/db"`
+	StringWithDefault string `env:"DATABASE_URL" envDefault:"postgres://localhost:5432/db"`
 
 	CustomSeparator []string `env:"SEPSTRINGS" envSeparator:":"`
 
@@ -135,9 +143,10 @@ type Config struct {
 }
 
 type ParentStruct struct {
-	InnerStruct *InnerStruct
-	unexported  *InnerStruct
-	Ignored     *http.Client
+	InnerStruct    *InnerStruct `env:",init"`
+	NilInnerStruct *InnerStruct
+	unexported     *InnerStruct
+	Ignored        *http.Client
 }
 
 type InnerStruct struct {
@@ -251,6 +260,12 @@ func TestParsesEnv(t *testing.T) {
 	t.Setenv("DURATION", tos(duration1))
 	t.Setenv("DURATIONS", toss(duration1, duration2))
 
+	location1 := time.UTC
+	location2, errLoadLocation := time.LoadLocation("Europe/Berlin")
+	isNoErr(t, errLoadLocation)
+	t.Setenv("LOCATION", tos(location1))
+	t.Setenv("LOCATIONS", toss(location1, location2))
+
 	unmarshaler1 := unmarshaler{time.Minute}
 	unmarshaler2 := unmarshaler{time.Millisecond * 1232}
 	t.Setenv("UNMARSHALER", tos(unmarshaler1.Duration))
@@ -261,11 +276,13 @@ func TestParsesEnv(t *testing.T) {
 	t.Setenv("URL", tos(url1))
 	t.Setenv("URLS", toss(url1, url2))
 
-	t.Setenv("SEPSTRINGS", strings.Join([]string{str1, str2}, ":"))
+	t.Setenv("SEPSTRINGS", str1+":"+str2)
 
 	nonDefinedStr := "nonDefinedStr"
 	t.Setenv("NONDEFINED_STR", nonDefinedStr)
 	t.Setenv("PRF_NONDEFINED_STR", nonDefinedStr)
+
+	t.Setenv("FOO", str1)
 
 	cfg := Config{}
 	isNoErr(t, Parse(&cfg))
@@ -374,6 +391,13 @@ func TestParsesEnv(t *testing.T) {
 	isEqual(t, &duration1, cfg.DurationPtrs[0])
 	isEqual(t, &duration2, cfg.DurationPtrs[1])
 
+	isEqual(t, *location1, cfg.Location)
+	isEqual(t, location1, cfg.LocationPtr)
+	isEqual(t, *location1, cfg.Locations[0])
+	isEqual(t, *location2, cfg.Locations[1])
+	isEqual(t, location1, cfg.LocationPtrs[0])
+	isEqual(t, location2, cfg.LocationPtrs[1])
+
 	isEqual(t, unmarshaler1, cfg.Unmarshaler)
 	isEqual(t, &unmarshaler1, cfg.UnmarshalerPtr)
 	isEqual(t, unmarshaler1, cfg.Unmarshalers[0])
@@ -388,7 +412,7 @@ func TestParsesEnv(t *testing.T) {
 	isEqual(t, url1, cfg.URLPtrs[0].String())
 	isEqual(t, url2, cfg.URLPtrs[1].String())
 
-	isEqual(t, "postgres://localhost:5432/db", cfg.StringWithdefault)
+	isEqual(t, "postgres://localhost:5432/db", cfg.StringWithDefault)
 	isEqual(t, nonDefinedStr, cfg.NonDefined.String)
 	isEqual(t, nonDefinedStr, cfg.NestedNonDefined.NonDefined.String)
 
@@ -402,9 +426,10 @@ func TestParsesEnv(t *testing.T) {
 
 func TestParsesEnv_Map(t *testing.T) {
 	type config struct {
-		MapStringString map[string]string `env:"MAP_STRING_STRING" envSeparator:","`
-		MapStringInt64  map[string]int64  `env:"MAP_STRING_INT64"`
-		MapStringBool   map[string]bool   `env:"MAP_STRING_BOOL" envSeparator:";"`
+		MapStringString                map[string]string `env:"MAP_STRING_STRING" envSeparator:","`
+		MapStringInt64                 map[string]int64  `env:"MAP_STRING_INT64"`
+		MapStringBool                  map[string]bool   `env:"MAP_STRING_BOOL" envSeparator:";"`
+		CustomSeparatorMapStringString map[string]string `env:"CUSTOM_SEPARATOR_MAP_STRING_STRING" envSeparator:"," envKeyValSeparator:"|"`
 	}
 
 	mss := map[string]string{
@@ -425,12 +450,19 @@ func TestParsesEnv_Map(t *testing.T) {
 	}
 	t.Setenv("MAP_STRING_BOOL", "k1:true;k2:false")
 
+	withCustomSeparator := map[string]string{
+		"k1": "v1",
+		"k2": "v2",
+	}
+	t.Setenv("CUSTOM_SEPARATOR_MAP_STRING_STRING", "k1|v1,k2|v2")
+
 	var cfg config
 	isNoErr(t, Parse(&cfg))
 
 	isEqual(t, mss, cfg.MapStringString)
 	isEqual(t, msi, cfg.MapStringInt64)
 	isEqual(t, msb, cfg.MapStringBool)
+	isEqual(t, withCustomSeparator, cfg.CustomSeparatorMapStringString)
 }
 
 func TestParsesEnvInvalidMap(t *testing.T) {
@@ -456,7 +488,7 @@ func TestParseCustomMapType(t *testing.T) {
 
 	var cfg config
 	isNoErr(t, ParseWithOptions(&cfg, Options{FuncMap: map[reflect.Type]ParserFunc{
-		reflect.TypeOf(custommap{}): func(value string) (interface{}, error) {
+		reflect.TypeOf(custommap{}): func(_ string) (interface{}, error) {
 			return custommap(map[string]bool{}), nil
 		},
 	}}))
@@ -518,7 +550,7 @@ func TestParseMapCustomKeyTypeError(t *testing.T) {
 
 	var cfg config
 	err := ParseWithOptions(&cfg, Options{FuncMap: map[reflect.Type]ParserFunc{
-		reflect.TypeOf(CustomKey("")): func(value string) (interface{}, error) {
+		reflect.TypeOf(CustomKey("")): func(_ string) (interface{}, error) {
 			return nil, fmt.Errorf("custom error")
 		},
 	}})
@@ -536,7 +568,7 @@ func TestParseMapCustomValueTypeError(t *testing.T) {
 
 	var cfg config
 	err := ParseWithOptions(&cfg, Options{FuncMap: map[reflect.Type]ParserFunc{
-		reflect.TypeOf(Customval("")): func(value string) (interface{}, error) {
+		reflect.TypeOf(Customval("")): func(_ string) (interface{}, error) {
 			return nil, fmt.Errorf("custom error")
 		},
 	}})
@@ -586,6 +618,15 @@ func TestParsesEnvInner(t *testing.T) {
 	isEqual(t, uint(8), cfg.InnerStruct.Number)
 }
 
+func TestParsesEnvInner_WhenInnerStructPointerIsNil(t *testing.T) {
+	t.Setenv("innervar", "someinnervalue")
+	t.Setenv("innernum", "8")
+	cfg := ParentStruct{}
+	isNoErr(t, Parse(&cfg))
+	isEqual(t, "someinnervalue", cfg.InnerStruct.Inner)
+	isEqual(t, uint(8), cfg.InnerStruct.Number)
+}
+
 func TestParsesEnvInnerFails(t *testing.T) {
 	type config struct {
 		Foo struct {
@@ -612,8 +653,8 @@ func TestParsesEnvInnerFailsMultipleErrors(t *testing.T) {
 	err := Parse(&config{})
 	isErrorWithMessage(t, err, `env: required environment variable "NAME" is not set; parse error on field "Number" of type "int": strconv.ParseInt: parsing "not-a-number": invalid syntax; required environment variable "AGE" is not set`)
 	isTrue(t, errors.Is(err, ParseError{}))
-	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
-	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
 }
 
 func TestParsesEnvInnerNil(t *testing.T) {
@@ -781,6 +822,20 @@ func TestInvalidDurations(t *testing.T) {
 	isTrue(t, errors.Is(err, ParseError{}))
 }
 
+func TestInvalidLocation(t *testing.T) {
+	t.Setenv("LOCATION", "should-be-a-valid-location")
+	err := Parse(&Config{})
+	isErrorWithMessage(t, err, `env: parse error on field "Location" of type "time.Location": unable to parse location: unknown time zone should-be-a-valid-location; parse error on field "LocationPtr" of type "*time.Location": unable to parse location: unknown time zone should-be-a-valid-location`)
+	isTrue(t, errors.Is(err, ParseError{}))
+}
+
+func TestInvalidLocations(t *testing.T) {
+	t.Setenv("LOCATIONS", "should-be-a-valid-location,UTC,Europe/Berlin")
+	err := Parse(&Config{})
+	isErrorWithMessage(t, err, `env: parse error on field "Locations" of type "[]time.Location": unable to parse location: unknown time zone should-be-a-valid-location; parse error on field "LocationPtrs" of type "[]*time.Location": unable to parse location: unknown time zone should-be-a-valid-location`)
+	isTrue(t, errors.Is(err, ParseError{}))
+}
+
 func TestParseStructWithoutEnvTag(t *testing.T) {
 	cfg := Config{}
 	isNoErr(t, Parse(&cfg))
@@ -880,7 +935,7 @@ func TestErrorRequiredNotSet(t *testing.T) {
 	}
 	err := Parse(&config{})
 	isErrorWithMessage(t, err, `env: required environment variable "IS_REQUIRED" is not set`)
-	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
 }
 
 func TestNoErrorNotEmptySet(t *testing.T) {
@@ -906,7 +961,7 @@ func TestErrorNotEmptySet(t *testing.T) {
 	}
 	err := Parse(&config{})
 	isErrorWithMessage(t, err, `env: environment variable "IS_REQUIRED" should not be empty`)
-	isTrue(t, errors.Is(err, EmptyEnvVarError{}))
+	isTrue(t, errors.Is(err, EmptyVarError{}))
 }
 
 func TestErrorRequiredAndNotEmptySet(t *testing.T) {
@@ -916,7 +971,7 @@ func TestErrorRequiredAndNotEmptySet(t *testing.T) {
 	}
 	err := Parse(&config{})
 	isErrorWithMessage(t, err, `env: environment variable "IS_REQUIRED" should not be empty`)
-	isTrue(t, errors.Is(err, EmptyEnvVarError{}))
+	isTrue(t, errors.Is(err, EmptyVarError{}))
 }
 
 func TestErrorRequiredNotSetWithDefault(t *testing.T) {
@@ -956,6 +1011,40 @@ func TestParseExpandOption(t *testing.T) {
 	isEqual(t, "def1", cfg.Default)
 }
 
+func TestParseExpandWithDefaultOption(t *testing.T) {
+	type config struct {
+		Host            string `env:"HOST" envDefault:"localhost"`
+		Port            int    `env:"PORT,expand" envDefault:"3000"`
+		OtherPort       int    `env:"OTHER_PORT" envDefault:"4000"`
+		CompoundDefault string `env:"HOST_PORT,expand" envDefault:"${HOST}:${PORT}"`
+		SimpleDefault   string `env:"DEFAULT,expand" envDefault:"def1"`
+		MixedDefault    string `env:"MIXED_DEFAULT,expand" envDefault:"$USER@${HOST}:${OTHER_PORT}"`
+		OverrideDefault string `env:"OVERRIDE_DEFAULT,expand"`
+		DefaultIsExpand string `env:"DEFAULT_IS_EXPAND,expand" envDefault:"$THIS_IS_EXPAND"`
+		NoDefault       string `env:"NO_DEFAULT,expand"`
+	}
+
+	t.Setenv("OTHER_PORT", "5000")
+	t.Setenv("USER", "jhon")
+	t.Setenv("THIS_IS_USED", "this is used instead")
+	t.Setenv("OVERRIDE_DEFAULT", "msg: ${THIS_IS_USED}")
+	t.Setenv("THIS_IS_EXPAND", "msg: ${THIS_IS_USED}")
+	t.Setenv("NO_DEFAULT", "$PORT:$OTHER_PORT")
+
+	cfg := config{}
+	err := Parse(&cfg)
+
+	isNoErr(t, err)
+	isEqual(t, "localhost", cfg.Host)
+	isEqual(t, 3000, cfg.Port)
+	isEqual(t, 5000, cfg.OtherPort)
+	isEqual(t, "localhost:3000", cfg.CompoundDefault)
+	isEqual(t, "def1", cfg.SimpleDefault)
+	isEqual(t, "jhon@localhost:5000", cfg.MixedDefault)
+	isEqual(t, "msg: this is used instead", cfg.OverrideDefault)
+	isEqual(t, "3000:5000", cfg.NoDefault)
+}
+
 func TestParseUnsetRequireOptions(t *testing.T) {
 	type config struct {
 		Password string `env:"PASSWORD,unset,required"`
@@ -964,7 +1053,7 @@ func TestParseUnsetRequireOptions(t *testing.T) {
 
 	err := Parse(&cfg)
 	isErrorWithMessage(t, err, `env: required environment variable "PASSWORD" is not set`)
-	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
 	t.Setenv("PASSWORD", "superSecret")
 	isNoErr(t, Parse(&cfg))
 
@@ -1064,7 +1153,7 @@ func TestCustomParserError(t *testing.T) {
 		name string
 	}
 
-	customParserFunc := func(v string) (interface{}, error) {
+	customParserFunc := func(_ string) (interface{}, error) {
 		return nil, errors.New("something broke")
 	}
 
@@ -1302,69 +1391,6 @@ func TestParseInvalidURL(t *testing.T) {
 	isTrue(t, errors.Is(err, ParseError{}))
 }
 
-func ExampleParse() {
-	type inner struct {
-		Foo string `env:"FOO" envDefault:"foobar"`
-	}
-	type config struct {
-		Home         string `env:"HOME,required"`
-		Port         int    `env:"PORT" envDefault:"3000"`
-		IsProduction bool   `env:"PRODUCTION"`
-		TempFolder   string `env:"TEMP_FOLDER,expand" envDefault:"${HOME}/.tmp"`
-		Inner        inner
-	}
-	os.Setenv("HOME", "/tmp/fakehome")
-	var cfg config
-	if err := Parse(&cfg); err != nil {
-		fmt.Println("failed:", err)
-	}
-	fmt.Printf("%+v", cfg)
-	// Output:  {Home:/tmp/fakehome Port:3000 IsProduction:false TempFolder:/tmp/fakehome/.tmp Inner:{Foo:foobar}}
-}
-
-func ExampleParse_onSet() {
-	type config struct {
-		Home         string `env:"HOME,required"`
-		Port         int    `env:"PORT" envDefault:"3000"`
-		IsProduction bool   `env:"PRODUCTION"`
-		NoEnvTag     bool
-		Inner        struct{} `envPrefix:"INNER_"`
-	}
-	os.Setenv("HOME", "/tmp/fakehome")
-	var cfg config
-	if err := ParseWithOptions(&cfg, Options{
-		OnSet: func(tag string, value interface{}, isDefault bool) {
-			fmt.Printf("Set %s to %v (default? %v)\n", tag, value, isDefault)
-		},
-	}); err != nil {
-		fmt.Println("failed:", err)
-	}
-	fmt.Printf("%+v", cfg)
-	// Output: Set HOME to /tmp/fakehome (default? false)
-	// Set PORT to 3000 (default? true)
-	// Set PRODUCTION to  (default? false)
-	// {Home:/tmp/fakehome Port:3000 IsProduction:false NoEnvTag:false Inner:{}}
-}
-
-func ExampleParse_defaults() {
-	type config struct {
-		A string `env:"FOO" envDefault:"foo"`
-		B string `env:"FOO"`
-	}
-
-	// env FOO is not set
-
-	cfg := config{
-		A: "A",
-		B: "B",
-	}
-	if err := Parse(&cfg); err != nil {
-		fmt.Println("failed:", err)
-	}
-	fmt.Printf("%+v", cfg)
-	// Output: {A:foo B:B}
-}
-
 func TestIgnoresUnexported(t *testing.T) {
 	type unexportedConfig struct {
 		home  string `env:"HOME"`
@@ -1414,32 +1440,6 @@ func TestPrecedenceUnmarshalText(t *testing.T) {
 	isEqual(t, []LogLevel{DebugLevel, InfoLevel}, cfg.LogLevels)
 }
 
-func ExampleParseWithOptions() {
-	type thing struct {
-		desc string
-	}
-
-	type conf struct {
-		Thing thing `env:"THING"`
-	}
-
-	os.Setenv("THING", "my thing")
-
-	c := conf{}
-
-	err := ParseWithOptions(&c, Options{FuncMap: map[reflect.Type]ParserFunc{
-		reflect.TypeOf(thing{}): func(v string) (interface{}, error) {
-			return thing{desc: v}, nil
-		},
-	}})
-	if err != nil {
-		fmt.Println(err)
-	}
-	fmt.Println(c.Thing.desc)
-	// Output:
-	// my thing
-}
-
 func TestFile(t *testing.T) {
 	type config struct {
 		SecretKey string `env:"SECRET_KEY,file"`
@@ -1472,7 +1472,7 @@ func TestFileNoParamRequired(t *testing.T) {
 
 	err := Parse(&config{})
 	isErrorWithMessage(t, err, `env: required environment variable "SECRET_KEY" is not set`)
-	isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
 }
 
 func TestFileBadFile(t *testing.T) {
@@ -1489,7 +1489,7 @@ func TestFileBadFile(t *testing.T) {
 	}
 
 	err := Parse(&config{})
-	isErrorWithMessage(t, err, fmt.Sprintf(`env: could not load content of file "%s" from variable SECRET_KEY: open %s: %s`, filename, filename, oserr))
+	isErrorWithMessage(t, err, fmt.Sprintf("env: could not load content of file %q from variable SECRET_KEY: open %s: %s", filename, filename, oserr))
 	isTrue(t, errors.Is(err, LoadFileContentError{}))
 }
 
@@ -1562,11 +1562,11 @@ func TestRequiredIfNoDefOption(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		err := ParseWithOptions(&cfg, Options{RequiredIfNoDef: true})
 		isErrorWithMessage(t, err, `env: required environment variable "NAME" is not set; required environment variable "FRUIT" is not set`)
-		isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+		isTrue(t, errors.Is(err, VarIsNotSetError{}))
 		t.Setenv("NAME", "John")
 		err = ParseWithOptions(&cfg, Options{RequiredIfNoDef: true})
 		isErrorWithMessage(t, err, `env: required environment variable "FRUIT" is not set`)
-		isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+		isTrue(t, errors.Is(err, VarIsNotSetError{}))
 	})
 
 	t.Run("all set", func(t *testing.T) {
@@ -1598,7 +1598,7 @@ func TestRequiredIfNoDefNested(t *testing.T) {
 
 		err := ParseWithOptions(&cfg, Options{RequiredIfNoDef: true})
 		isErrorWithMessage(t, err, `env: required environment variable "SERVER_PORT" is not set`)
-		isTrue(t, errors.Is(err, EnvVarIsNotSetError{}))
+		isTrue(t, errors.Is(err, VarIsNotSetError{}))
 	})
 
 	t.Run("all set", func(t *testing.T) {
@@ -1700,32 +1700,43 @@ func TestComplePrefix(t *testing.T) {
 
 func TestNoEnvKey(t *testing.T) {
 	type Config struct {
-		Foo    string
-		FooBar string
-		bar    string
+		Foo      string
+		FooBar   string
+		HTTPPort int
+		bar      string
 	}
 	var cfg Config
 	isNoErr(t, ParseWithOptions(&cfg, Options{
 		UseFieldNameByDefault: true,
 		Environment: map[string]string{
-			"FOO":     "fooval",
-			"FOO_BAR": "foobarval",
+			"FOO":       "fooval",
+			"FOO_BAR":   "foobarval",
+			"HTTP_PORT": "10",
 		},
 	}))
 	isEqual(t, "fooval", cfg.Foo)
 	isEqual(t, "foobarval", cfg.FooBar)
+	isEqual(t, 10, cfg.HTTPPort)
 	isEqual(t, "", cfg.bar)
 }
 
 func TestToEnv(t *testing.T) {
 	for in, out := range map[string]string{
-		"Foo":      "FOO",
-		"FooBar":   "FOO_BAR",
-		"fooBar":   "FOO_BAR",
-		"Foo_Bar":  "FOO_BAR",
-		"Foo__Bar": "FOO__BAR",
+		"Foo":          "FOO",
+		"FooBar":       "FOO_BAR",
+		"FOOBar":       "FOO_BAR",
+		"Foo____Bar":   "FOO_BAR",
+		"fooBar":       "FOO_BAR",
+		"Foo_Bar":      "FOO_BAR",
+		"Foo__Bar":     "FOO_BAR",
+		"HTTPPort":     "HTTP_PORT",
+		"SSHPort":      "SSH_PORT",
+		"_SSH___Port_": "SSH_PORT",
+		"_PortHTTP":    "PORT_HTTP",
 	} {
-		isEqual(t, out, toEnvName(in))
+		t.Run(in, func(t *testing.T) {
+			isEqual(t, out, toEnvName(in))
+		})
 	}
 }
 
@@ -1799,6 +1810,46 @@ func TestGetFieldParamsError(t *testing.T) {
 	_, err := GetFieldParams(config)
 	isErrorWithMessage(t, err, "env: expected a pointer to a Struct")
 	isTrue(t, errors.Is(err, NotStructPtrError{}))
+}
+
+type Conf struct {
+	Foo string `env:"FOO" envDefault:"bar"`
+}
+
+func TestParseAs(t *testing.T) {
+	config, err := ParseAs[Conf]()
+	isNoErr(t, err)
+	isEqual(t, "bar", config.Foo)
+}
+
+func TestParseAsWithOptions(t *testing.T) {
+	config, err := ParseAsWithOptions[Conf](Options{
+		Environment: map[string]string{
+			"FOO": "not bar",
+		},
+	})
+	isNoErr(t, err)
+	isEqual(t, "not bar", config.Foo)
+}
+
+type ConfRequired struct {
+	Foo string `env:"FOO,required"`
+}
+
+func TestMust(t *testing.T) {
+	t.Run("error", func(t *testing.T) {
+		defer func() {
+			err := recover()
+			isErrorWithMessage(t, err.(error), `env: required environment variable "FOO" is not set`)
+		}()
+		conf := Must(ParseAs[ConfRequired]())
+		isEqual(t, "", conf.Foo)
+	})
+	t.Run("success", func(t *testing.T) {
+		t.Setenv("FOO", "bar")
+		conf := Must(ParseAs[ConfRequired]())
+		isEqual(t, "bar", conf.Foo)
+	})
 }
 
 func isTrue(tb testing.TB, b bool) {
@@ -1894,4 +1945,469 @@ func TestParseWithOptionsOverride(t *testing.T) {
 			return time.Duration(intervalI), nil
 		},
 	}}))
+}
+
+type Password []byte
+
+func (p *Password) UnmarshalText(text []byte) error {
+	out, err := base64.StdEncoding.DecodeString(string(text))
+	if err != nil {
+		return err
+	}
+	*p = out
+	return nil
+}
+
+type UsernameAndPassword struct {
+	Username string    `env:"USER"`
+	Password *Password `env:"PWD"`
+}
+
+func TestBase64Password(t *testing.T) {
+	t.Setenv("USER", "admin")
+	t.Setenv("PWD", base64.StdEncoding.EncodeToString([]byte("admin123")))
+	var c UsernameAndPassword
+	isNoErr(t, Parse(&c))
+	isEqual(t, "admin", c.Username)
+	isEqual(t, "admin123", string(*c.Password))
+}
+
+func TestIssue304(t *testing.T) {
+	t.Setenv("BACKEND_URL", "https://google.com")
+	type Config struct {
+		BackendURL string `envDefault:"localhost:8000"`
+	}
+	cfg, err := ParseAsWithOptions[Config](Options{
+		UseFieldNameByDefault: true,
+	})
+	isNoErr(t, err)
+	isEqual(t, "https://google.com", cfg.BackendURL)
+}
+
+func TestIssue234(t *testing.T) {
+	type Test struct {
+		Str string `env:"TEST"`
+	}
+	type ComplexConfig struct {
+		Foo   *Test `envPrefix:"FOO_" env:",init"`
+		Bar   Test  `envPrefix:"BAR_"`
+		Clean *Test
+	}
+
+	t.Setenv("FOO_TEST", "kek")
+	t.Setenv("BAR_TEST", "lel")
+
+	cfg := ComplexConfig{}
+	isNoErr(t, Parse(&cfg))
+	isEqual(t, "kek", cfg.Foo.Str)
+	isEqual(t, "lel", cfg.Bar.Str)
+}
+
+type Issue308 struct {
+	Inner Issue308Map `env:"A_MAP"`
+}
+
+type Issue308Map map[string][]string
+
+func (rc *Issue308Map) UnmarshalText(b []byte) error {
+	m := map[string][]string{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	*rc = Issue308Map(m)
+	return nil
+}
+
+func TestIssue308(t *testing.T) {
+	t.Setenv("A_MAP", `{"FOO":["BAR", "ZAZ"]}`)
+
+	cfg := Issue308{}
+	isNoErr(t, Parse(&cfg))
+	isEqual(t, Issue308Map{"FOO": []string{"BAR", "ZAZ"}}, cfg.Inner)
+}
+
+func TestIssue317(t *testing.T) {
+	type TestConfig struct {
+		U1 *url.URL `env:"U1"`
+		U2 *url.URL `env:"U2,init"`
+	}
+	cases := []struct {
+		desc                   string
+		environment            map[string]string
+		expectedU1, expectedU2 *url.URL
+	}{
+		{
+			desc:        "unset",
+			environment: map[string]string{},
+			expectedU1:  nil,
+			expectedU2:  &url.URL{},
+		},
+		{
+			desc:        "empty",
+			environment: map[string]string{"U1": "", "U2": ""},
+			expectedU1:  nil,
+			expectedU2:  &url.URL{},
+		},
+		{
+			desc:        "set",
+			environment: map[string]string{"U1": "https://example.com/"},
+			expectedU1:  &url.URL{Scheme: "https", Host: "example.com", Path: "/"},
+			expectedU2:  &url.URL{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			cfg := TestConfig{}
+			err := ParseWithOptions(&cfg, Options{Environment: tc.environment})
+			isNoErr(t, err)
+			isEqual(t, tc.expectedU1, cfg.U1)
+			isEqual(t, tc.expectedU2, cfg.U2)
+		})
+	}
+}
+
+func TestIssue310(t *testing.T) {
+	type TestConfig struct {
+		URL *url.URL
+	}
+	cfg, err := ParseAs[TestConfig]()
+	isNoErr(t, err)
+	isEqual(t, nil, cfg.URL)
+}
+
+func TestMultipleTagOptions(t *testing.T) {
+	type TestConfig struct {
+		URL *url.URL `env:"URL,init,unset"`
+	}
+	t.Run("unset", func(t *testing.T) {
+		cfg, err := ParseAs[TestConfig]()
+		isNoErr(t, err)
+		isEqual(t, &url.URL{}, cfg.URL)
+	})
+	t.Run("empty", func(t *testing.T) {
+		t.Setenv("URL", "")
+		cfg, err := ParseAs[TestConfig]()
+		isNoErr(t, err)
+		isEqual(t, &url.URL{}, cfg.URL)
+	})
+	t.Run("set", func(t *testing.T) {
+		t.Setenv("URL", "https://github.com/caarlos0")
+		cfg, err := ParseAs[TestConfig]()
+		isNoErr(t, err)
+		isEqual(t, &url.URL{Scheme: "https", Host: "github.com", Path: "/caarlos0"}, cfg.URL)
+		isEqual(t, "", os.Getenv("URL"))
+	})
+}
+
+func TestIssue298(t *testing.T) {
+	type Test struct {
+		Str string `env:"STR"`
+		Num int    `env:"NUM"`
+	}
+	type ComplexConfig struct {
+		Foo *[]Test `envPrefix:"FOO_"`
+		Bar []Test  `envPrefix:"BAR"`
+		Baz []Test  `env:",init"`
+	}
+
+	t.Setenv("FOO_0_STR", "f0t")
+	t.Setenv("FOO_0_NUM", "101")
+	t.Setenv("FOO_1_STR", "f1t")
+	t.Setenv("FOO_1_NUM", "111")
+
+	t.Setenv("BAR_0_STR", "b0t")
+	// t.Setenv("BAR_0_NUM", "202") // Not overridden
+	t.Setenv("BAR_1_STR", "b1t")
+	t.Setenv("BAR_1_NUM", "212")
+
+	t.Setenv("0_STR", "bt")
+	t.Setenv("1_NUM", "10")
+
+	sample := make([]Test, 1)
+	sample[0].Str = "overridden text"
+	sample[0].Num = 99999999
+	cfg := ComplexConfig{Bar: sample}
+
+	isNoErr(t, Parse(&cfg))
+
+	isEqual(t, "f0t", (*cfg.Foo)[0].Str)
+	isEqual(t, 101, (*cfg.Foo)[0].Num)
+	isEqual(t, "f1t", (*cfg.Foo)[1].Str)
+	isEqual(t, 111, (*cfg.Foo)[1].Num)
+
+	isEqual(t, "b0t", cfg.Bar[0].Str)
+	isEqual(t, 99999999, cfg.Bar[0].Num)
+	isEqual(t, "b1t", cfg.Bar[1].Str)
+	isEqual(t, 212, cfg.Bar[1].Num)
+
+	isEqual(t, "bt", cfg.Baz[0].Str)
+	isEqual(t, 0, cfg.Baz[0].Num)
+	isEqual(t, "", cfg.Baz[1].Str)
+	isEqual(t, 10, cfg.Baz[1].Num)
+}
+
+func TestIssue298ErrorNestedFieldRequiredNotSet(t *testing.T) {
+	type Test struct {
+		Str string `env:"STR,required"`
+		Num int    `env:"NUM"`
+	}
+	type ComplexConfig struct {
+		Foo *[]Test `envPrefix:"FOO"`
+	}
+
+	t.Setenv("FOO_0_NUM", "101")
+
+	cfg := ComplexConfig{}
+	err := Parse(&cfg)
+	isErrorWithMessage(t, err, `env: required environment variable "FOO_0_STR" is not set`)
+	isTrue(t, errors.Is(err, VarIsNotSetError{}))
+}
+
+func TestIssue320(t *testing.T) {
+	type Test struct {
+		Str string `env:"STR"`
+		Num int    `env:"NUM"`
+	}
+	type ComplexConfig struct {
+		Foo *[]Test `envPrefix:"FOO_"`
+		Bar []Test  `envPrefix:"BAR"`
+		Baz []Test  `env:",init"`
+	}
+
+	cfg := ComplexConfig{}
+
+	isNoErr(t, Parse(&cfg))
+
+	isEqual(t, cfg.Foo, nil)
+	isEqual(t, cfg.Bar, nil)
+	isEqual(t, cfg.Baz, nil)
+}
+
+func TestParseWithOptionsRenamedDefault(t *testing.T) {
+	type config struct {
+		Str string `env:"STR" envDefault:"foo" myDefault:"bar"`
+	}
+
+	cfg := &config{}
+	isNoErr(t, ParseWithOptions(cfg, Options{DefaultValueTagName: "myDefault"}))
+	isEqual(t, "bar", cfg.Str)
+
+	isNoErr(t, Parse(cfg))
+	isEqual(t, "foo", cfg.Str)
+}
+
+func TestSetDefaultsForZeroValuesOnly(t *testing.T) {
+	type config struct {
+		Str string  `env:"STR" envDefault:"foo"`
+		Int int     `env:"INT" envDefault:"42"`
+		Url url.URL `env:"URL" envDefault:"https://github.com/caarlos0"`
+	}
+	defUrl, err := url.Parse("https://github.com/caarlos0")
+	isNoErr(t, err)
+
+	u, err := url.Parse("https://localhost/foo")
+	isNoErr(t, err)
+
+	for _, tc := range []struct {
+		Name     string
+		Options  Options
+		Expected config
+	}{
+		{
+			Name:    "true",
+			Options: Options{SetDefaultsForZeroValuesOnly: true},
+			Expected: config{
+				Str: "isSet",
+				Int: 1,
+				Url: *u,
+			},
+		},
+		{
+			Name:    "false",
+			Options: Options{SetDefaultsForZeroValuesOnly: false},
+			Expected: config{
+				Str: "foo",
+				Int: 42,
+				Url: *defUrl,
+			},
+		},
+		{
+			Name:    "default",
+			Options: Options{},
+			Expected: config{
+				Str: "foo",
+				Int: 42,
+				Url: *defUrl,
+			},
+		},
+	} {
+		t.Run(tc.Name, func(t *testing.T) {
+			cfg := &config{
+				Str: "isSet",
+				Int: 1,
+				Url: *u,
+			}
+			isNoErr(t, ParseWithOptions(cfg, tc.Options))
+			isEqual(t, tc.Expected, *cfg)
+		})
+	}
+}
+
+func TestParseWithOptionsRenamedPrefix(t *testing.T) {
+	type Config struct {
+		Str string `env:"STR"`
+	}
+	type ComplexConfig struct {
+		Foo Config `envPrefix:"FOO_" myPrefix:"BAR_"`
+	}
+
+	t.Setenv("FOO_STR", "101")
+	t.Setenv("BAR_STR", "202")
+	t.Setenv("APP_BAR_STR", "303")
+
+	cfg := &ComplexConfig{}
+	isNoErr(t, ParseWithOptions(cfg, Options{PrefixTagName: "myPrefix"}))
+	isEqual(t, "202", cfg.Foo.Str)
+
+	isNoErr(t, ParseWithOptions(cfg, Options{PrefixTagName: "myPrefix", Prefix: "APP_"}))
+	isEqual(t, "303", cfg.Foo.Str)
+
+	isNoErr(t, Parse(cfg))
+	isEqual(t, "101", cfg.Foo.Str)
+}
+
+func TestFieldIgnored(t *testing.T) {
+	type Test struct {
+		Foo string `env:"FOO"`
+		Bar string `env:"BAR,-"`
+	}
+	type ComplexConfig struct {
+		Str string `env:"STR"`
+		Foo Test   `env:"FOO" envPrefix:"FOO_"`
+		Bar Test   `env:"-" envPrefix:"BAR_"`
+	}
+	t.Setenv("STR", "101")
+	t.Setenv("FOO_FOO", "202")
+	t.Setenv("FOO_BAR", "303")
+	t.Setenv("BAR_FOO", "404")
+	t.Setenv("BAR_BAR", "505")
+
+	var cfg ComplexConfig
+	isNoErr(t, Parse(&cfg))
+	isEqual(t, "101", cfg.Str)
+	isEqual(t, "202", cfg.Foo.Foo)
+	isEqual(t, "", cfg.Foo.Bar)
+	isEqual(t, "", cfg.Bar.Foo)
+	isEqual(t, "", cfg.Bar.Bar)
+}
+
+func TestNoEnvKeyIgnored(t *testing.T) {
+	type Config struct {
+		Foo    string `env:"-"`
+		FooBar string
+	}
+
+	t.Setenv("FOO", "101")
+	t.Setenv("FOO_BAR", "202")
+
+	var cfg Config
+	isNoErr(t, ParseWithOptions(&cfg, Options{UseFieldNameByDefault: true}))
+	isEqual(t, "", cfg.Foo)
+	isEqual(t, "202", cfg.FooBar)
+}
+
+func TestIssue339(t *testing.T) {
+	t.Run("Should parse with bool ptr set and env undefined", func(t *testing.T) {
+		existingValue := true
+		cfg := Config{
+			BoolPtr: &existingValue,
+		}
+
+		isNoErr(t, Parse(&cfg))
+
+		isEqual(t, &existingValue, cfg.BoolPtr)
+	})
+
+	t.Run("Should parse with bool ptr set and env defined", func(t *testing.T) {
+		existingValue := true
+		cfg := Config{
+			BoolPtr: &existingValue,
+		}
+
+		newValue := false
+		t.Setenv("BOOL", strconv.FormatBool(newValue))
+
+		isNoErr(t, Parse(&cfg))
+
+		isEqual(t, &newValue, cfg.BoolPtr)
+	})
+
+	t.Run("Should parse with string ptr set and env undefined", func(t *testing.T) {
+		existingValue := "one"
+		cfg := Config{
+			StringPtr: &existingValue,
+		}
+
+		isNoErr(t, Parse(&cfg))
+
+		isEqual(t, &existingValue, cfg.StringPtr)
+	})
+
+	t.Run("Should parse with string ptr set and env defined", func(t *testing.T) {
+		existingValue := "one"
+		cfg := Config{
+			StringPtr: &existingValue,
+		}
+
+		newValue := "two"
+		t.Setenv("STRING", newValue)
+
+		isNoErr(t, Parse(&cfg))
+
+		isEqual(t, &newValue, cfg.StringPtr)
+	})
+}
+
+func TestIssue350(t *testing.T) {
+	t.Setenv("MAP", "url:https://foo.bar:2030")
+
+	type Config struct {
+		Map map[string]string `env:"MAP"`
+	}
+
+	var cfg Config
+	isNoErr(t, Parse(&cfg))
+	isEqual(t, map[string]string{"url": "https://foo.bar:2030"}, cfg.Map)
+}
+
+func TestEnvBleed(t *testing.T) {
+	type Config struct {
+		Foo string `env:"FOO"`
+	}
+
+	t.Setenv("FOO", "101")
+
+	t.Run("Default env with value", func(t *testing.T) {
+		var cfg Config
+		isNoErr(t, ParseWithOptions(&cfg, Options{}))
+		isEqual(t, "101", cfg.Foo)
+	})
+
+	t.Run("Empty env without value", func(t *testing.T) {
+		var cfg Config
+		isNoErr(t, ParseWithOptions(&cfg, Options{Environment: map[string]string{}}))
+		isEqual(t, "", cfg.Foo)
+	})
+
+	t.Run("Custom env with overwritten value", func(t *testing.T) {
+		var cfg Config
+		isNoErr(t, ParseWithOptions(&cfg, Options{Environment: map[string]string{"FOO": "202"}}))
+		isEqual(t, "202", cfg.Foo)
+	})
+
+	t.Run("Custom env without value", func(t *testing.T) {
+		var cfg Config
+		isNoErr(t, ParseWithOptions(&cfg, Options{Environment: map[string]string{"BAR": "202"}}))
+		isEqual(t, "", cfg.Foo)
+	})
 }

@@ -1,3 +1,18 @@
+// Package env is a simple, zero-dependencies library to parse environment
+// variables into structs.
+//
+// Example:
+//
+//	type config struct {
+//		Home string `env:"HOME"`
+//	}
+//	// parse
+//	var cfg config
+//	err := env.Parse(&cfg)
+//	// or parse with generics
+//	cfg, err := env.ParseAs[config]()
+//
+// Check the examples and README for more detailed usage.
 package env
 
 import (
@@ -72,94 +87,188 @@ var (
 
 func defaultTypeParsers() map[reflect.Type]ParserFunc {
 	return map[reflect.Type]ParserFunc{
-		reflect.TypeOf(url.URL{}): func(v string) (interface{}, error) {
-			u, err := url.Parse(v)
-			if err != nil {
-				return nil, newParseValueError("unable to parse URL", err)
-			}
-			return *u, nil
-		},
-		reflect.TypeOf(time.Nanosecond): func(v string) (interface{}, error) {
-			s, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, newParseValueError("unable to parse duration", err)
-			}
-			return s, err
-		},
+		reflect.TypeOf(url.URL{}):       parseURL,
+		reflect.TypeOf(time.Nanosecond): parseDuration,
+		reflect.TypeOf(time.Location{}): parseLocation,
 	}
 }
 
-// ParserFunc defines the signature of a function that can be used within `CustomParsers`.
+func parseURL(v string) (interface{}, error) {
+	u, err := url.Parse(v)
+	if err != nil {
+		return nil, newParseValueError("unable to parse URL", err)
+	}
+	return *u, nil
+}
+
+func parseDuration(v string) (interface{}, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return nil, newParseValueError("unable to parse duration", err)
+	}
+	return d, err
+}
+
+func parseLocation(v string) (interface{}, error) {
+	loc, err := time.LoadLocation(v)
+	if err != nil {
+		return nil, newParseValueError("unable to parse location", err)
+	}
+	return *loc, nil
+}
+
+// ParserFunc defines the signature of a function that can be used within
+// `Options`' `FuncMap`.
 type ParserFunc func(v string) (interface{}, error)
 
 // OnSetFn is a hook that can be run when a value is set.
 type OnSetFn func(tag string, value interface{}, isDefault bool)
 
 // processFieldFn is a function which takes all information about a field and processes it.
-type processFieldFn func(refField reflect.Value, refTypeField reflect.StructField, opts Options, fieldParams FieldParams) error
+type processFieldFn func(
+	refField reflect.Value,
+	refTypeField reflect.StructField,
+	opts Options,
+	fieldParams FieldParams,
+) error
 
 // Options for the parser.
 type Options struct {
 	// Environment keys and values that will be accessible for the service.
 	Environment map[string]string
 
-	// TagName specifies another tagname to use rather than the default env.
+	// TagName specifies another tag name to use rather than the default 'env'.
 	TagName string
 
-	// RequiredIfNoDef automatically sets all env as required if they do not
+	// PrefixTagName specifies another prefix tag name to use rather than the default 'envPrefix'.
+	PrefixTagName string
+
+	// DefaultValueTagName specifies another default tag name to use rather than the default 'envDefault'.
+	DefaultValueTagName string
+
+	// RequiredIfNoDef automatically sets all fields as required if they do not
 	// declare 'envDefault'.
 	RequiredIfNoDef bool
 
 	// OnSet allows to run a function when a value is set.
 	OnSet OnSetFn
 
-	// Prefix define a prefix for each key.
+	// Prefix define a prefix for every key.
 	Prefix string
 
-	// UseFieldNameByDefault defines whether or not env should use the field
+	// UseFieldNameByDefault defines whether or not `env` should use the field
 	// name by default if the `env` key is missing.
+	// Note that the field name will be "converted" to conform with environment
+	// variable names conventions.
 	UseFieldNameByDefault bool
+
+	// SetDefaultsForZeroValuesOnly defines whether to set defaults for zero values
+	// If the `env` variable for the value is not set
+	// and `envDefault` is set
+	// and the value is not a zero value for the the type
+	// and SetDefaultsForZeroValuesOnly=true
+	// the value from `envDefault` will be ignored
+	// Usefull for mixing default values from `envDefault` and struct initialization
+	SetDefaultsForZeroValuesOnly bool
 
 	// Custom parse functions for different types.
 	FuncMap map[reflect.Type]ParserFunc
+
+	// Used internally. maps the env variable key to its resolved string value.
+	// (for env var expansion)
+	rawEnvVars map[string]string
+}
+
+func (opts *Options) getRawEnv(s string) string {
+	val := opts.rawEnvVars[s]
+	if val == "" {
+		val = opts.Environment[s]
+	}
+	return os.Expand(val, opts.getRawEnv)
 }
 
 func defaultOptions() Options {
 	return Options{
-		TagName:     "env",
-		Environment: toMap(os.Environ()),
-		FuncMap:     defaultTypeParsers(),
+		TagName:             "env",
+		PrefixTagName:       "envPrefix",
+		DefaultValueTagName: "envDefault",
+		Environment:         toMap(os.Environ()),
+		FuncMap:             defaultTypeParsers(),
+		rawEnvVars:          make(map[string]string),
 	}
 }
 
-func customOptions(opt Options) Options {
-	defOpts := defaultOptions()
-	if opt.TagName == "" {
-		opt.TagName = defOpts.TagName
-	}
-	if opt.Environment == nil {
-		opt.Environment = defOpts.Environment
-	}
-	if opt.FuncMap == nil {
-		opt.FuncMap = map[reflect.Type]ParserFunc{}
-	}
-	for k, v := range defOpts.FuncMap {
-		if _, exists := opt.FuncMap[k]; !exists {
-			opt.FuncMap[k] = v
+func mergeOptions[T any](target, source *T) {
+	targetPtr := reflect.ValueOf(target).Elem()
+	sourcePtr := reflect.ValueOf(source).Elem()
+
+	targetType := targetPtr.Type()
+	for i := 0; i < targetPtr.NumField(); i++ {
+		fieldName := targetType.Field(i).Name
+		targetField := targetPtr.Field(i)
+		sourceField := sourcePtr.FieldByName(fieldName)
+
+		if targetField.CanSet() && !isZero(sourceField) {
+			// FuncMaps are being merged, while Environments must be overwritten
+			if fieldName == "FuncMap" {
+				if !sourceField.IsZero() {
+					iter := sourceField.MapRange()
+					for iter.Next() {
+						targetField.SetMapIndex(iter.Key(), iter.Value())
+					}
+				}
+			} else {
+				targetField.Set(sourceField)
+			}
 		}
 	}
-	return opt
+}
+
+func isZero(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Func, reflect.Map, reflect.Slice:
+		return v.IsNil()
+	default:
+		zero := reflect.Zero(v.Type())
+		return v.Interface() == zero.Interface()
+	}
+}
+
+func customOptions(opts Options) Options {
+	defOpts := defaultOptions()
+	mergeOptions(&defOpts, &opts)
+	return defOpts
+}
+
+func optionsWithSliceEnvPrefix(opts Options, index int) Options {
+	return Options{
+		Environment:                  opts.Environment,
+		TagName:                      opts.TagName,
+		PrefixTagName:                opts.PrefixTagName,
+		DefaultValueTagName:          opts.DefaultValueTagName,
+		RequiredIfNoDef:              opts.RequiredIfNoDef,
+		OnSet:                        opts.OnSet,
+		Prefix:                       fmt.Sprintf("%s%d_", opts.Prefix, index),
+		UseFieldNameByDefault:        opts.UseFieldNameByDefault,
+		SetDefaultsForZeroValuesOnly: opts.SetDefaultsForZeroValuesOnly,
+		FuncMap:                      opts.FuncMap,
+		rawEnvVars:                   opts.rawEnvVars,
+	}
 }
 
 func optionsWithEnvPrefix(field reflect.StructField, opts Options) Options {
 	return Options{
-		Environment:           opts.Environment,
-		TagName:               opts.TagName,
-		RequiredIfNoDef:       opts.RequiredIfNoDef,
-		OnSet:                 opts.OnSet,
-		Prefix:                opts.Prefix + field.Tag.Get("envPrefix"),
-		UseFieldNameByDefault: opts.UseFieldNameByDefault,
-		FuncMap:               opts.FuncMap,
+		Environment:                  opts.Environment,
+		TagName:                      opts.TagName,
+		PrefixTagName:                opts.PrefixTagName,
+		DefaultValueTagName:          opts.DefaultValueTagName,
+		RequiredIfNoDef:              opts.RequiredIfNoDef,
+		OnSet:                        opts.OnSet,
+		Prefix:                       opts.Prefix + field.Tag.Get(opts.PrefixTagName),
+		UseFieldNameByDefault:        opts.UseFieldNameByDefault,
+		SetDefaultsForZeroValuesOnly: opts.SetDefaultsForZeroValuesOnly,
+		FuncMap:                      opts.FuncMap,
+		rawEnvVars:                   opts.rawEnvVars,
 	}
 }
 
@@ -173,6 +282,30 @@ func Parse(v interface{}) error {
 // environment variables.
 func ParseWithOptions(v interface{}, opts Options) error {
 	return parseInternal(v, setField, customOptions(opts))
+}
+
+// ParseAs parses the given struct type containing `env` tags and loads its
+// values from environment variables.
+func ParseAs[T any]() (T, error) {
+	var t T
+	err := Parse(&t)
+	return t, err
+}
+
+// ParseWithOptions parses the given struct type containing `env` tags and
+// loads its values from environment variables.
+func ParseAsWithOptions[T any](opts Options) (T, error) {
+	var t T
+	err := ParseWithOptions(&t, opts)
+	return t, err
+}
+
+// Must panic is if err is not nil, and returns t otherwise.
+func Must[T any](t T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return t
 }
 
 // GetFieldParams parses a struct containing `env` tags and returns information about
@@ -240,14 +373,19 @@ func doParse(ref reflect.Value, processField processFieldFn, opts Options) error
 	return agrErr
 }
 
-func doParseField(refField reflect.Value, refTypeField reflect.StructField, processField processFieldFn, opts Options) error {
+func doParseField(
+	refField reflect.Value,
+	refTypeField reflect.StructField,
+	processField processFieldFn,
+	opts Options,
+) error {
 	if !refField.CanSet() {
 		return nil
 	}
-	if reflect.Ptr == refField.Kind() && !refField.IsNil() {
+	if refField.Kind() == reflect.Ptr && refField.Elem().Kind() == reflect.Struct && !refField.IsNil() {
 		return parseInternal(refField.Interface(), processField, optionsWithEnvPrefix(refTypeField, opts))
 	}
-	if reflect.Struct == refField.Kind() && refField.CanAddr() && refField.Type().Name() == "" {
+	if refField.Kind() == reflect.Struct && refField.CanAddr() && refField.Type().Name() == "" {
 		return parseInternal(refField.Addr().Interface(), processField, optionsWithEnvPrefix(refTypeField, opts))
 	}
 
@@ -256,12 +394,108 @@ func doParseField(refField reflect.Value, refTypeField reflect.StructField, proc
 		return err
 	}
 
+	if params.Ignored {
+		return nil
+	}
+
 	if err := processField(refField, refTypeField, opts, params); err != nil {
 		return err
 	}
 
-	if reflect.Struct == refField.Kind() {
+	if params.Init && isInvalidPtr(refField) {
+		refField.Set(reflect.New(refField.Type().Elem()))
+		refField = refField.Elem()
+	}
+
+	if refField.Kind() == reflect.Struct {
 		return doParse(refField, processField, optionsWithEnvPrefix(refTypeField, opts))
+	}
+
+	if isSliceOfStructs(refTypeField) {
+		return doParseSlice(refField, processField, optionsWithEnvPrefix(refTypeField, opts))
+	}
+
+	return nil
+}
+
+func isSliceOfStructs(refTypeField reflect.StructField) bool {
+	field := refTypeField.Type
+
+	// *[]struct
+	if field.Kind() == reflect.Ptr {
+		field = field.Elem()
+		if field.Kind() == reflect.Slice && field.Elem().Kind() == reflect.Struct {
+			return true
+		}
+	}
+
+	// []struct{}
+	if field.Kind() == reflect.Slice && field.Elem().Kind() == reflect.Struct {
+		return true
+	}
+
+	return false
+}
+
+func doParseSlice(ref reflect.Value, processField processFieldFn, opts Options) error {
+	if opts.Prefix != "" && !strings.HasSuffix(opts.Prefix, string(underscore)) {
+		opts.Prefix += string(underscore)
+	}
+
+	var environments []string
+	for environment := range opts.Environment {
+		if strings.HasPrefix(environment, opts.Prefix) {
+			environments = append(environments, environment)
+		}
+	}
+
+	if len(environments) > 0 {
+		counter := 0
+		for finished := false; !finished; {
+			finished = true
+			prefix := fmt.Sprintf("%s%d%c", opts.Prefix, counter, underscore)
+			for _, variable := range environments {
+				if strings.HasPrefix(variable, prefix) {
+					counter++
+					finished = false
+					break
+				}
+			}
+		}
+
+		sliceType := ref.Type()
+		var initialized int
+		if reflect.Ptr == ref.Kind() {
+			sliceType = sliceType.Elem()
+			// Due to the rest of code the pre-initialized slice has no chance for this situation
+			initialized = 0
+		} else {
+			initialized = ref.Len()
+		}
+
+		var capacity int
+		if capacity = initialized; counter > initialized {
+			capacity = counter
+		}
+		result := reflect.MakeSlice(sliceType, capacity, capacity)
+		for i := 0; i < capacity; i++ {
+			item := result.Index(i)
+			if i < initialized {
+				item.Set(ref.Index(i))
+			}
+			if err := doParse(item, processField, optionsWithSliceEnvPrefix(opts, i)); err != nil {
+				return err
+			}
+		}
+
+		if result.Len() > 0 {
+			if reflect.Ptr == ref.Kind() {
+				resultPtr := reflect.New(sliceType)
+				resultPtr.Elem().Set(result)
+				result = resultPtr
+			}
+			ref.Set(result)
+		}
 	}
 
 	return nil
@@ -273,7 +507,7 @@ func setField(refField reflect.Value, refTypeField reflect.StructField, opts Opt
 		return err
 	}
 
-	if value != "" {
+	if value != "" && (!opts.SetDefaultsForZeroValuesOnly || refField.IsZero()) {
 		return set(refField, refTypeField, value, opts.FuncMap)
 	}
 
@@ -285,8 +519,16 @@ const underscore rune = '_'
 func toEnvName(input string) string {
 	var output []rune
 	for i, c := range input {
-		if i > 0 && output[i-1] != underscore && c != underscore && unicode.ToUpper(c) == c {
-			output = append(output, underscore)
+		if c == underscore {
+			continue
+		}
+		if len(output) > 0 && unicode.IsUpper(c) {
+			if len(input) > i+1 {
+				peek := rune(input[i+1])
+				if unicode.IsLower(peek) || unicode.IsLower(rune(input[i-1])) {
+					output = append(output, underscore)
+				}
+			}
 		}
 		output = append(output, unicode.ToUpper(c))
 	}
@@ -304,6 +546,8 @@ type FieldParams struct {
 	Unset           bool
 	NotEmpty        bool
 	Expand          bool
+	Init            bool
+	Ignored         bool
 }
 
 func parseFieldParams(field reflect.StructField, opts Options) (FieldParams, error) {
@@ -312,7 +556,7 @@ func parseFieldParams(field reflect.StructField, opts Options) (FieldParams, err
 		ownKey = toEnvName(field.Name)
 	}
 
-	defaultValue, hasDefaultValue := field.Tag.Lookup("envDefault")
+	defaultValue, hasDefaultValue := field.Tag.Lookup(opts.DefaultValueTagName)
 
 	result := FieldParams{
 		OwnKey:          ownKey,
@@ -320,6 +564,7 @@ func parseFieldParams(field reflect.StructField, opts Options) (FieldParams, err
 		Required:        opts.RequiredIfNoDef,
 		DefaultValue:    defaultValue,
 		HasDefaultValue: hasDefaultValue,
+		Ignored:         ownKey == "-",
 	}
 
 	for _, tag := range tags {
@@ -336,6 +581,10 @@ func parseFieldParams(field reflect.StructField, opts Options) (FieldParams, err
 			result.NotEmpty = true
 		case "expand":
 			result.Expand = true
+		case "init":
+			result.Init = true
+		case "-":
+			result.Ignored = true
 		default:
 			return FieldParams{}, newNoSupportedTagOptionError(tag)
 		}
@@ -347,22 +596,29 @@ func parseFieldParams(field reflect.StructField, opts Options) (FieldParams, err
 func get(fieldParams FieldParams, opts Options) (val string, err error) {
 	var exists, isDefault bool
 
-	val, exists, isDefault = getOr(fieldParams.Key, fieldParams.DefaultValue, fieldParams.HasDefaultValue, opts.Environment)
+	val, exists, isDefault = getOr(
+		fieldParams.Key,
+		fieldParams.DefaultValue,
+		fieldParams.HasDefaultValue,
+		opts.Environment,
+	)
 
 	if fieldParams.Expand {
-		val = os.ExpandEnv(val)
+		val = os.Expand(val, opts.getRawEnv)
 	}
+
+	opts.rawEnvVars[fieldParams.OwnKey] = val
 
 	if fieldParams.Unset {
 		defer os.Unsetenv(fieldParams.Key)
 	}
 
-	if fieldParams.Required && !exists && len(fieldParams.OwnKey) > 0 {
-		return "", newEnvVarIsNotSet(fieldParams.Key)
+	if fieldParams.Required && !exists && fieldParams.OwnKey != "" {
+		return "", newVarIsNotSetError(fieldParams.Key)
 	}
 
 	if fieldParams.NotEmpty && val == "" {
-		return "", newEmptyEnvVarError(fieldParams.Key)
+		return "", newEmptyVarError(fieldParams.Key)
 	}
 
 	if fieldParams.LoadFile && val != "" {
@@ -392,7 +648,7 @@ func getFromFile(filename string) (value string, err error) {
 	return string(b), err
 }
 
-func getOr(key, defaultValue string, defExists bool, envs map[string]string) (string, bool, bool) {
+func getOr(key, defaultValue string, defExists bool, envs map[string]string) (val string, exists, isDefault bool) {
 	value, exists := envs[key]
 	switch {
 	case (!exists || key == "") && defExists:
@@ -518,11 +774,16 @@ func handleMap(field reflect.Value, value string, sf reflect.StructField, funcMa
 		separator = ","
 	}
 
+	keyValSeparator := sf.Tag.Get("envKeyValSeparator")
+	if keyValSeparator == "" {
+		keyValSeparator = ":"
+	}
+
 	result := reflect.MakeMap(sf.Type)
 	for _, part := range strings.Split(value, separator) {
-		pairs := strings.Split(part, ":")
+		pairs := strings.SplitN(part, keyValSeparator, 2)
 		if len(pairs) != 2 {
-			return newParseError(sf, fmt.Errorf(`%q should be in "key:value" format`, part))
+			return newParseError(sf, fmt.Errorf(`%q should be in "key%svalue" format`, part, keyValSeparator))
 		}
 
 		key, err := keyParserFunc(pairs[0])
@@ -543,7 +804,7 @@ func handleMap(field reflect.Value, value string, sf reflect.StructField, funcMa
 }
 
 func asTextUnmarshaler(field reflect.Value) encoding.TextUnmarshaler {
-	if reflect.Ptr == field.Kind() {
+	if field.Kind() == reflect.Ptr {
 		if field.IsNil() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
@@ -588,4 +849,8 @@ func parseTextUnmarshalers(field reflect.Value, data []string, sf reflect.Struct
 // can use as Options.Environment field
 func ToMap(env []string) map[string]string {
 	return toMap(env)
+}
+
+func isInvalidPtr(v reflect.Value) bool {
+	return reflect.Ptr == v.Kind() && v.Elem().Kind() == reflect.Invalid
 }
